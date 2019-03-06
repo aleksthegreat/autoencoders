@@ -1,0 +1,125 @@
+from keras.activations import elu
+from keras.layers import Input, Dense, Lambda
+from keras.models import Model
+from keras.objectives import binary_crossentropy
+from keras.callbacks import LearningRateScheduler
+from keras import backend as K
+from imblearn.keras import balanced_batch_generator
+from imblearn.under_sampling import NearMiss, RandomUnderSampler, CondensedNearestNeighbour, AllKNN
+from sklearn.model_selection import KFold
+from imblearn.over_sampling import RandomOverSampler
+# Horovod: adjust learning rate based on number of GPUs.
+opt = keras.optimizers.SGD(lr=0.00001, decay=0.96, momentum=0.001, nesterov=True)
+# Horovod: add Horovod Distributed Optimizer.
+opt = hvd.DistributedOptimizer(opt)
+
+
+nb_folds = 3
+nb_epoch = 2
+batch_size = 240
+encoding_dim =1000
+hidden_dim = int(encoding_dim * 10) #i.e. 7
+sgd = SGD(lr=0.001, momentum=0.001, decay=0.96)
+folds = StratifiedKFold(n_splits=nb_folds, shuffle=True, random_state=420)
+#folds = KFold(n_splits = nb_folds, random_state = 338, shuffle = True)
+train_auto = np.zeros(train[trafo_columns].shape)
+test_auto = np.zeros(test[trafo_columns].shape)
+predictions = np.zeros(len(train))
+label_cols = ["target"]
+y_split = train[label_cols].values
+
+cp = ModelCheckpoint(filepath="autoencoder_0.h5",
+                               save_best_only=True,
+                               verbose=0)
+
+tb = TensorBoard(log_dir='./logs',
+                histogram_freq=0,
+                write_graph=True,
+                write_images=True)
+
+es= EarlyStopping(monitor='val_loss',
+                  min_delta=0,
+                  patience=50,
+                  verbose=1, mode='auto')
+
+for fold_, (trn_idx, val_idx) in enumerate(folds.split(y_split[:,0], y_split[:,0])):
+    print("fold {}".format(fold_))
+#for fold_, (trn_idx, val_idx) in enumerate(folds.split(train)):
+#    print("fold {}".format(fold_))
+
+    trn_data, train_y = train[trafo_columns].iloc[trn_idx], train['target'].iloc[trn_idx]
+    val_data, valid_y = train[trafo_columns].iloc[val_idx], train['target'].iloc[val_idx]
+
+    input_dim = trn_data.shape[1] #num of columns, 30
+    input_layer = Input(shape=(input_dim, ))
+    
+    # Q(z|X) -- encoder
+    h_q = Dense(encoding_dim, activation='relu')(input_layer)
+    mu = Dense(hidden_dim, activation='linear')(h_q)
+    log_sigma = Dense(hidden_dim, activation='linear')(h_q)
+    
+    def sample_z(args):
+        mu, log_sigma = args
+        batch = K.shape(mu)[0]
+        dim = K.int_shape(mu)[1]
+        eps = K.random_normal(shape=(batch, dim))
+        return mu + K.exp(0.5 * log_sigma) * eps
+
+    # Sample z ~ Q(z|X)
+    z = Lambda(sample_z)([mu, log_sigma])
+    
+    # P(X|z) -- decoder
+    decoder_hidden = Dense(hidden_dim, activation='relu')
+    decoder_out = Dense(input_dim, activation='softmax')
+    h_p = decoder_hidden(z)
+    outputs = decoder_out(h_p)
+    
+    # Overall VAE model, for reconstruction and training
+    vae = Model(input_layer, outputs)
+    
+    # Encoder model, to encode input into latent variable
+    # We use the mean as the output as it is the center point, the representative of the gaussian
+    encoder = Model(input_layer, mu)
+
+    # Generator model, generate new data given latent variable z
+    d_in = Input(shape=(hidden_dim,))
+    d_h = decoder_hidden(d_in)
+    d_out = decoder_out(d_h)
+    decoder = Model(d_in, d_out)
+    
+    def vae_loss(y_true, y_pred):
+        """ Calculate loss = reconstruction loss + KL loss for each data in minibatch """
+        # E[log P(X|z)]
+        recon = K.sum(K.binary_crossentropy(y_pred, y_true), axis=1)
+        # D_KL(Q(z|X) || P(z|X)); calculate in closed form as both dist. are Gaussian
+        kl = 0.5 * K.sum(K.exp(log_sigma) + K.square(mu) - 1. - log_sigma, axis=1)
+        return recon + kl
+    
+    vae.compile(optimizer='sgd', loss=vae_loss, metrics=['acc'])
+    
+    def add_noise(series, noise_level):
+        return series * (1 + noise_level * np.random.randn(series.shape[1]))
+    
+    trn_data = add_noise(trn_data, 0.05)
+#    val_data = add_noise(val_data, 0.07)
+    
+
+    training_generator, steps_per_epoch = balanced_batch_generator(trn_data, train_y, sampler=RandomOverSampler(),
+                                                batch_size=batch_size, random_state=42)
+
+    callback_history = vae.fit_generator(training_generator,epochs=nb_epoch,
+                       validation_data=[val_data, val_data], 
+                       steps_per_epoch=steps_per_epoch, verbose=1,
+                       callbacks=[cp, tb, es])
+
+    train_auto[val_idx] += vae.predict(train.iloc[val_idx][trafo_columns], verbose=1)
+    test_auto += vae.predict(test[trafo_columns], verbose=1)
+
+    mse = vae.predict(train[trafo_columns] / folds.n_splits, verbose=1)
+    predictions += np.mean(np.power(train[trafo_columns] - mse, 2), axis=1)
+
+train_auto = pd.DataFrame(train_auto / folds.n_splits)
+test_auto = pd.DataFrame(test_auto / folds.n_splits)
+error_df = pd.DataFrame({'Reconstruction_error': predictions,
+                        'True_class': train['target']})
+error_df.describe()
