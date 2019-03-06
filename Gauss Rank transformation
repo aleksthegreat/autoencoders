@@ -1,0 +1,11 @@
+# Gauss Rank transformation
+from scipy.special import erfinv
+
+trafo_columns = [c for c in df.columns if len(df[c].unique()) != 2]
+for col in trafo_columns:
+    values = sorted(set(df[col]))
+    # Because erfinv(1) is inf, we shrink the range into (-0.9, 0.9)
+    f = pd.Series(np.linspace(-0.9, 0.9, len(values)), index=values)
+    f = np.sqrt(2) * erfinv(f)
+    f -= f.mean()
+    df[col] = df[col].map(f)
