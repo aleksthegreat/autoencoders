@@ -14,3 +14,5 @@ features_train = _model.predict(x_train)
 features_test = _model.predict(x_test)
 print(features_train.shape, ' train samples shape')
 print(features_test.shape, ' train samples shape')
+
+http://dkopczyk.quantee.co.uk/dae-part3/
